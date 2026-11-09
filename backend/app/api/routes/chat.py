@@ -53,6 +53,7 @@ async def chat(request: ChatRequest):
             history=history,
             city=request.city or "北京",
             user_id=user_id,
+            conversation_id=conversation_id,
         )
 
         # 保存用户消息和助手回答

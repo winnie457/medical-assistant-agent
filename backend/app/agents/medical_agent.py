@@ -8,6 +8,8 @@ import logging
 from typing import Dict, Any, List, Optional, TypedDict, Annotated
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.config import get_stream_writer
 from langchain_core.messages import (
     HumanMessage,
     AIMessage,
@@ -39,6 +41,18 @@ from .state_middleware import AgentStateMiddleware
 from ..services.suspension_service import get_suspension_manager
 
 logger = logging.getLogger(__name__)
+
+
+def _emit(payload: Dict[str, Any]) -> None:
+    """向 LangGraph 的 custom 流推送事件。
+
+    仅在 stream_mode 包含 "custom" 时生效；非流式 graph.invoke 场景下
+    静默忽略，保证两条链路共用同一套节点实现。
+    """
+    try:
+        get_stream_writer()(payload)
+    except Exception:  # 非流式或没有 custom 流时 writer 不可用
+        return
 
 
 # ============ 系统提示词 ============
@@ -119,6 +133,10 @@ class AgentState(TypedDict):
     tool_calls_history: List[Dict[str, Any]]
     final_answer: Optional[str]
     user_profile: Optional[str]
+    # 是否有交互确认通道：流式 True、非流式 False（用于 HITL 分流）
+    interactive: bool
+    # 本轮是否已在入口确认过高风险操作（避免同一轮重复询问）
+    approved_high_risk: bool
 
 
 # ============ 工具列表 ============
@@ -146,12 +164,22 @@ class MedicalAgent:
         self.tools = get_tools()
         self.settings = get_settings()
         self.llm_with_tools = self.llm.bind_tools(self.tools)
+        self.checkpointer = self._build_checkpointer()
         self.graph = self._build_graph()
         # Never-Throw 工具执行器（带降级方案）
         self.tool_executor = NeverThrowToolExecutor(
             tools=self.tools,
             fallback_providers=ToolFallbackProvider.get_all_fallbacks()
         )
+
+    def _build_checkpointer(self):
+        """创建会话状态检查点存储。
+
+        当前使用进程内 InMemorySaver，把 thread_id ↔ 会话状态的链路打通；
+        后续可替换为 AsyncSqliteSaver 等持久化实现，使进程重启后会话与
+        interrupt 中断状态仍可恢复。
+        """
+        return InMemorySaver()
 
     def _build_graph(self) -> StateGraph:
         """构建 LangGraph 状态图"""
@@ -185,7 +213,7 @@ class MedicalAgent:
             }
         )
 
-        return workflow.compile()
+        return workflow.compile(checkpointer=self.checkpointer)
 
     def _agent_node(self, state: AgentState) -> Dict[str, Any]:
         """Agent 节点：思考并决定下一步行动"""
@@ -210,8 +238,32 @@ class MedicalAgent:
             )
         )
 
-        # 调用 LLM
-        response = self.llm_with_tools.invoke([system_msg] + messages)
+        # 推送推理进度（custom 流；非流式调用时静默忽略）
+        _emit({
+            "type": "thought",
+            "content": f"第{iteration + 1}步：分析问题中...",
+            "iteration": iteration + 1,
+        })
+
+        # 调用 LLM：用 stream 累积完整响应，
+        # 既保持非流式聚合结果不变，又让流式场景能捕获 token 增量
+        full_chunk: Optional[AIMessageChunk] = None
+        for chunk in self.llm_with_tools.stream([system_msg] + messages):
+            full_chunk = chunk if full_chunk is None else full_chunk + chunk
+        response = message_chunk_to_message(full_chunk) if full_chunk is not None else AIMessage(content="")
+
+        # 推送本轮工具调用意图（含风险分级），供流式前端渲染
+        for tool_call in getattr(response, "tool_calls", []) or []:
+            tool_name = tool_call.get("name", "")
+            _emit({
+                "type": "tool_call",
+                "tool_name": tool_name,
+                "tool_description": self._get_tool_description(tool_name),
+                "arguments": tool_call.get("args", {}) or {},
+                "risk_level": get_tool_risk_level(tool_name).value,
+                "risk_label": get_risk_label(tool_name),
+                "iteration": iteration + 1,
+            })
 
         # 工具调用历史由 tools 节点在执行后统一写入（含最终状态），
         # 此处不再预写 "calling"，避免同一个工具在历史里出现两条记录
@@ -286,6 +338,15 @@ class MedicalAgent:
                     "duration": 0,
                     "iteration": iteration,
                 })
+                _emit({
+                    "type": "tool_result",
+                    "tool_name": tool_name,
+                    "status": "blocked_requires_approval",
+                    "risk_level": "high",
+                    "result_preview": "非流式入口，高风险工具已拦截",
+                    "duration": 0,
+                    "iteration": iteration,
+                })
                 # 必须为同一轮的所有 tool_calls 都补齐 ToolMessage，保持配对完整
                 blocked = True
                 continue
@@ -304,6 +365,17 @@ class MedicalAgent:
                 "error_message": exec_result.error_message,
                 "retry_count": exec_result.retry_count,
                 "used_fallback": exec_result.used_fallback,
+                "duration": exec_result.duration,
+                "iteration": iteration,
+            })
+            _emit({
+                "type": "tool_result",
+                "tool_name": tool_name,
+                "status": "success" if exec_result.success else "failed",
+                "error_type": exec_result.error_type,
+                "retry_count": exec_result.retry_count,
+                "used_fallback": exec_result.used_fallback,
+                "result_preview": tool_output[:150] + "..." if len(tool_output) > 150 else tool_output,
                 "duration": exec_result.duration,
                 "iteration": iteration,
             })
@@ -329,7 +401,8 @@ class MedicalAgent:
         return f"已进行{len(user_msgs)}轮对话"
 
     def chat(self, message: str, history: Optional[List[BaseMessage]] = None,
-             city: str = "北京", user_id: str = "default") -> Dict[str, Any]:
+             city: str = "北京", user_id: str = "default",
+             conversation_id: Optional[str] = None) -> Dict[str, Any]:
         """
         非流式对话
 
@@ -338,6 +411,7 @@ class MedicalAgent:
             history: 对话历史
             city: 所在城市
             user_id: 用户标识（用于加载长期记忆）
+            conversation_id: 会话 ID，作为 checkpointer 的 thread_id
 
         Returns:
             包含回答、工具调用历史等信息的字典
@@ -380,9 +454,14 @@ class MedicalAgent:
             "tool_calls_history": [],
             "final_answer": None,
             "user_profile": profile.format_for_prompt(),
+            # 非流式入口没有交互确认通道（Phase 3 起用于 HITL 分流）
+            "interactive": False,
+            "approved_high_risk": False,
         }
 
-        result = self.graph.invoke(initial_state)
+        # thread_id 绑定会话：图状态由 checkpointer 按会话保存与恢复
+        config = {"configurable": {"thread_id": conversation_id or f"sync-{uuid.uuid4().hex[:8]}"}}
+        result = self.graph.invoke(initial_state, config)
         final_messages = result["messages"]
         final_answer = (
             result.get("final_answer")
@@ -424,6 +503,9 @@ class MedicalAgent:
             "tool_calls_history": [],
             "final_answer": None,
             "user_profile": user_profile_text,
+            # 流式入口有交互通道（Phase 3 起由 precheck 节点用 interrupt 接管）
+            "interactive": True,
+            "approved_high_risk": False,
         }
 
         # 【查询级前置门禁】用药类问题先确认再进入 ReAct 循环。
