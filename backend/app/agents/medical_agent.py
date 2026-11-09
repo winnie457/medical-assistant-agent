@@ -1,15 +1,14 @@
 """智能就医助手 ReAct Agent - 基于 LangGraph 实现"""
 
 import json
-import time
 import uuid
-import asyncio
 import logging
 from typing import Dict, Any, List, Optional, TypedDict, Annotated
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.config import get_stream_writer
+from langgraph.types import Command, interrupt
 from langchain_core.messages import (
     HumanMessage,
     AIMessage,
@@ -38,7 +37,6 @@ from ..tools.risk_level import (
     detect_medication_intent,
 )
 from .state_middleware import AgentStateMiddleware
-from ..services.suspension_service import get_suspension_manager
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +51,33 @@ def _emit(payload: Dict[str, Any]) -> None:
         get_stream_writer()(payload)
     except Exception:  # 非流式或没有 custom 流时 writer 不可用
         return
+
+
+def _approval_payload(tool_name: str, tool_args: Dict[str, Any], iteration: int) -> Dict[str, Any]:
+    """构造高风险操作确认载荷（既作为 interrupt 的值，也直接作为 SSE 事件）"""
+    prompt = get_approval_prompt(tool_name) or {}
+    return {
+        "type": "approval_required",
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "risk_level": "high",
+        "title": prompt.get("title", "确认操作"),
+        "message": prompt.get("message", "该操作属于高风险内容，是否继续？"),
+        "warning": prompt.get("warning", ""),
+        "confirm_text": prompt.get("confirm_text", "确认"),
+        "cancel_text": prompt.get("cancel_text", "取消"),
+        "iteration": iteration,
+    }
+
+
+def _final_ai_content(messages: List[BaseMessage]) -> str:
+    """取最后一条不含 tool_calls 的 AI 消息正文，作为最终回答"""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and not (getattr(msg, "tool_calls", None) or []):
+            content = msg.content
+            if isinstance(content, str) and content.strip():
+                return content
+    return ""
 
 
 # ============ 系统提示词 ============
@@ -182,38 +207,165 @@ class MedicalAgent:
         return InMemorySaver()
 
     def _build_graph(self) -> StateGraph:
-        """构建 LangGraph 状态图"""
+        """构建 LangGraph 状态图
+
+        结构：precheck → agent ⇄ approval → tools → END
+        - precheck：入口前置门禁，用药类问题在进入循环前先确认
+        - approval：工具级风险门禁，模型选择高风险工具时挂起确认
+        两条链路（非流式 invoke / 流式 astream）共用同一张图，
+        交互能力由 state["interactive"] 决定，而非维护两套 ReAct 逻辑。
+        """
         workflow = StateGraph(AgentState)
 
-        # 添加节点
+        workflow.add_node("precheck", self._precheck_node)
         workflow.add_node("agent", self._agent_node)
+        workflow.add_node("approval", self._approval_gate_node)
         # 与非流式接口共用同一套容错执行器 + 高风险 fail-closed 门禁
         workflow.add_node("tools", self._safe_tools_node)
 
-        # 设置入口
-        workflow.set_entry_point("agent")
+        workflow.set_entry_point("precheck")
 
-        # 添加条件边：agent -> tools 或 agent -> END
+        # precheck 已给出收口话术（拦截/拒绝）则直接结束，否则进入 ReAct 循环
+        workflow.add_conditional_edges(
+            "precheck",
+            lambda state: "end" if state.get("final_answer") else "agent",
+            {"agent": "agent", "end": END},
+        )
+
+        # agent 决定是否调用工具；调用前先经过风险门禁
         workflow.add_conditional_edges(
             "agent",
             self._should_continue,
-            {
-                "continue": "tools",
-                "end": END
-            }
+            {"continue": "approval", "end": END},
         )
 
-        # tools -> agent；若本轮因高危工具拦截已收口，则直接结束
+        # 门禁通过（或已确认/无需确认）→ 执行工具；被拒绝 → 收口结束
+        workflow.add_conditional_edges(
+            "approval",
+            lambda state: "end" if state.get("final_answer") else "tools",
+            {"tools": "tools", "end": END},
+        )
+
+        # tools → agent；若本轮因高危工具拦截已收口，则直接结束
         workflow.add_conditional_edges(
             "tools",
             lambda state: "end" if state.get("final_answer") else "continue",
-            {
-                "continue": "agent",
-                "end": END
-            }
+            {"continue": "agent", "end": END},
         )
 
         return workflow.compile(checkpointer=self.checkpointer)
+
+    def _precheck_node(self, state: AgentState) -> Dict[str, Any]:
+        """入口前置门禁
+
+        只拦工具调用是不够的：模型可以选择"直接作答"而绕过确认，
+        因此在进入 ReAct 循环前先做一次确定性的用药意图识别。
+        - 交互入口（流式）：interrupt 挂起，等待用户确认
+        - 非交互入口（非流式）：没有确认通道 → fail-closed 直接收口
+        """
+        text = ""
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, HumanMessage):
+                text = msg.content if isinstance(msg.content, str) else str(msg.content)
+                break
+
+        if not detect_medication_intent(text):
+            return {}
+
+        tool_args = {"query": text}
+
+        if not state.get("interactive"):
+            return {
+                "messages": [AIMessage(content=HIGH_RISK_DECLINED_ANSWER)],
+                "final_answer": HIGH_RISK_DECLINED_ANSWER,
+                "tool_calls_history": [{
+                    "tool_name": "medication_consultation",
+                    "arguments": tool_args,
+                    "result_preview": "非流式入口，用药类问题已拦截",
+                    "status": "blocked_requires_approval",
+                    "risk_level": "high",
+                    "duration": 0,
+                    "iteration": 1,
+                }],
+            }
+
+        decision = interrupt(_approval_payload("medication_consultation", tool_args, 1))
+
+        if (decision or {}).get("approved"):
+            return {"approved_high_risk": True}
+
+        reason = (decision or {}).get("reason") or "用户取消"
+        return {
+            "messages": [AIMessage(content=HIGH_RISK_DECLINED_ANSWER)],
+            "final_answer": HIGH_RISK_DECLINED_ANSWER,
+            "tool_calls_history": [{
+                "tool_name": "medication_consultation",
+                "arguments": tool_args,
+                "result_preview": f"用户拒绝: {reason}",
+                "status": "rejected",
+                "risk_level": "high",
+                "duration": 0,
+                "iteration": 1,
+            }],
+        }
+
+    def _approval_gate_node(self, state: AgentState) -> Dict[str, Any]:
+        """工具级风险门禁
+
+        模型决定调用高风险工具时挂起等待确认。interrupt() 必须位于节点
+        的副作用之前：恢复时节点会从头重跑，前面的逻辑必须是幂等的。
+        """
+        if state.get("approved_high_risk") or not state.get("interactive"):
+            return {}
+
+        tool_calls = getattr(state["messages"][-1], "tool_calls", None) or []
+        risky_calls = [tc for tc in tool_calls if is_high_risk(tc.get("name", ""))]
+        if not risky_calls:
+            return {}
+
+        first = risky_calls[0]
+        decision = interrupt(_approval_payload(
+            first.get("name", ""),
+            first.get("args", {}) or {},
+            state.get("iteration_count", 1),
+        ))
+
+        if (decision or {}).get("approved"):
+            return {"approved_high_risk": True}
+
+        reason = (decision or {}).get("reason") or "用户取消"
+
+        # 用户拒绝：为本轮所有 tool_call 补齐 ToolMessage，避免消息配对断裂；
+        # 之后直接收口，不再让模型改用自身知识重新作答
+        new_messages: List[BaseMessage] = []
+        for tool_call in tool_calls:
+            tool_call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+            new_messages.append(ToolMessage(
+                content=json.dumps({
+                    "error": True,
+                    "error_type": "user_rejected",
+                    "error_message": f"用户拒绝执行此操作：{reason}",
+                    "hint": "用户已拒绝该工具调用，本轮直接结束，不要改用自身知识重新回答。",
+                }, ensure_ascii=False),
+                tool_call_id=tool_call_id,
+            ))
+
+        history = list(state.get("tool_calls_history", []))
+        history.append({
+            "tool_name": first.get("name", ""),
+            "arguments": first.get("args", {}) or {},
+            "result_preview": f"用户拒绝: {reason}",
+            "status": "rejected",
+            "risk_level": "high",
+            "duration": 0,
+            "iteration": state.get("iteration_count", 1),
+        })
+
+        return {
+            "messages": new_messages,
+            "tool_calls_history": history,
+            "final_answer": HIGH_RISK_DECLINED_ANSWER,
+        }
 
     def _agent_node(self, state: AgentState) -> Dict[str, Any]:
         """Agent 节点：思考并决定下一步行动"""
@@ -248,8 +400,21 @@ class MedicalAgent:
         # 调用 LLM：用 stream 累积完整响应，
         # 既保持非流式聚合结果不变，又让流式场景能捕获 token 增量
         full_chunk: Optional[AIMessageChunk] = None
+        emitted_delta = False
+        reset_sent = False
         for chunk in self.llm_with_tools.stream([system_msg] + messages):
             full_chunk = chunk if full_chunk is None else full_chunk + chunk
+
+            if getattr(chunk, "tool_call_chunks", None):
+                # 一旦转入工具调用，之前误推的正文需要通知前端清空
+                if emitted_delta and not reset_sent:
+                    reset_sent = True
+                    _emit({"type": "answer_reset"})
+            elif chunk.content:
+                text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+                emitted_delta = True
+                _emit({"type": "answer_delta", "content": text})
+
         response = message_chunk_to_message(full_chunk) if full_chunk is not None else AIMessage(content="")
 
         # 推送本轮工具调用意图（含风险分级），供流式前端渲染
@@ -315,7 +480,8 @@ class MedicalAgent:
             tool_args = tool_call.get("args", {}) or {}
             tool_call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:8]}"
 
-            if is_high_risk(tool_name):
+            # 未经确认的高风险工具一律 fail-closed；已由 precheck / approval 门禁确认的放行
+            if is_high_risk(tool_name) and not state.get("approved_high_risk"):
                 tool_output = json.dumps(
                     {
                         "error": True,
@@ -411,7 +577,8 @@ class MedicalAgent:
             history: 对话历史
             city: 所在城市
             user_id: 用户标识（用于加载长期记忆）
-            conversation_id: 会话 ID，作为 checkpointer 的 thread_id
+            conversation_id: 会话 ID（仅用于日志与外部关联）
+            interactive: 由入口固定为 False，高风险操作一律 fail-closed
 
         Returns:
             包含回答、工具调用历史等信息的字典
@@ -420,28 +587,6 @@ class MedicalAgent:
 
         # 非流式路径同样注入长期记忆，保持与流式一致
         profile = get_memory_manager().get_profile(user_id)
-
-        # 【查询级前置门禁】用药类问题即使模型选择直接作答，也必须先经用户确认；
-        # 非流式入口没有交互确认通道 → fail-closed
-        if detect_medication_intent(message):
-            logger.info("[HITL] 非流式入口识别到用药类问题，已按拒绝处理")
-            return {
-                "answer": HIGH_RISK_DECLINED_ANSWER,
-                "messages": [
-                    HumanMessage(content=message),
-                    AIMessage(content=HIGH_RISK_DECLINED_ANSWER),
-                ],
-                "tool_calls_history": [{
-                    "tool_name": "medication_consultation",
-                    "arguments": {"query": message},
-                    "result_preview": "非流式入口，用药类问题已拦截",
-                    "status": "blocked_requires_approval",
-                    "risk_level": "high",
-                    "duration": 0,
-                    "iteration": 1,
-                }],
-                "iteration_count": 0,
-            }
 
         messages = history.copy() if history else []
         messages.append(HumanMessage(content=message))
@@ -454,22 +599,27 @@ class MedicalAgent:
             "tool_calls_history": [],
             "final_answer": None,
             "user_profile": profile.format_for_prompt(),
-            # 非流式入口没有交互确认通道（Phase 3 起用于 HITL 分流）
+            # 非流式入口没有交互确认通道，precheck 会据此 fail-closed
             "interactive": False,
             "approved_high_risk": False,
         }
 
-        # thread_id 绑定会话：图状态由 checkpointer 按会话保存与恢复
-        config = {"configurable": {"thread_id": conversation_id or f"sync-{uuid.uuid4().hex[:8]}"}}
-        result = self.graph.invoke(initial_state, config)
+        # 每次请求使用独立的 run_id 作为 thread_id：
+        # 历史消息由入口整表传入，避免同一会话多轮之间消息重复累积
+        run_id = f"sync-{uuid.uuid4().hex[:12]}"
+        config = {"configurable": {"thread_id": run_id}}
+
+        try:
+            result = self.graph.invoke(initial_state, config)
+        finally:
+            # 非流式不会产生 interrupt，本轮结束后即可释放检查点
+            self.checkpointer.delete_thread(run_id)
+
         final_messages = result["messages"]
-        final_answer = (
-            result.get("final_answer")
-            or (final_messages[-1].content if final_messages else "抱歉，我暂时无法回答这个问题。")
-        )
+        final_answer = result.get("final_answer") or _final_ai_content(final_messages)
 
         return {
-            "answer": final_answer,
+            "answer": final_answer or "抱歉，我暂时无法回答这个问题。",
             "messages": final_messages,
             "tool_calls_history": result.get("tool_calls_history", []),
             "iteration_count": result.get("iteration_count", 0)
@@ -478,20 +628,17 @@ class MedicalAgent:
     async def chat_stream(self, message: str, history: Optional[List[BaseMessage]] = None,
                           city: str = "北京", conversation_id: str = None, user_id: str = "default"):
         """
-        流式对话（生成器方式）
+        流式对话：驱动同一张 LangGraph，把 custom 事件与 interrupt 翻译成 SSE 事件
 
         Yields:
-            不同类型的事件：thought, tool_call, tool_result, answer, done,
-            approval_required（高风险工具等待用户确认）
+            thought / tool_call / tool_result / answer_delta / answer_reset /
+            approval_required / answer / done
         """
-        suspension_manager = get_suspension_manager()
         from ..memory.memory_manager import get_memory_manager
-        memory_manager = get_memory_manager()
-        
+
         # 加载用户健康画像（长期记忆）
-        profile = memory_manager.get_profile(user_id)
-        user_profile_text = profile.format_for_prompt()
-        
+        profile = get_memory_manager().get_profile(user_id)
+
         messages = history.copy() if history else []
         messages.append(HumanMessage(content=message))
 
@@ -502,309 +649,82 @@ class MedicalAgent:
             "max_iterations": self.settings.agent_max_iterations,
             "tool_calls_history": [],
             "final_answer": None,
-            "user_profile": user_profile_text,
-            # 流式入口有交互通道（Phase 3 起由 precheck 节点用 interrupt 接管）
+            "user_profile": profile.format_for_prompt(),
+            # 流式入口有交互通道，precheck / approval 节点可以 interrupt 挂起
             "interactive": True,
             "approved_high_risk": False,
         }
 
-        # 【查询级前置门禁】用药类问题先确认再进入 ReAct 循环。
-        # 只拦工具调用是不够的：模型可以选择“直接回答”而绕过确认，因此入口先做确定性识别。
-        approved_tool_names: set[str] = set()
-        if detect_medication_intent(message):
-            approval_prompt = get_approval_prompt("medication_consultation") or {}
-            tool_args = {"query": message}
-            yield {
-                "type": "approval_required",
-                "tool_name": "medication_consultation",
-                "tool_args": tool_args,
-                "risk_level": "high",
-                "title": approval_prompt.get("title", "确认操作"),
-                "message": approval_prompt.get("message", "用药建议属于高风险信息，是否继续查看？"),
-                "warning": approval_prompt.get("warning", ""),
-                "confirm_text": approval_prompt.get("confirm_text", "确认"),
-                "cancel_text": approval_prompt.get("cancel_text", "取消"),
-                "iteration": 1,
-            }
+        run_id = f"run-{uuid.uuid4().hex[:12]}"
+        config = {"configurable": {"thread_id": run_id}}
 
-            approved = False
-            if conversation_id:
-                approved = await suspension_manager.suspend(
-                    conversation_id=conversation_id,
-                    tool_name="medication_consultation",
-                    tool_args=tool_args,
-                )
-            else:
-                logger.warning("[HITL] 缺少 conversation_id，用药类问题按拒绝处理")
+        async for event in self._adapt_stream(
+            self.graph.astream(state, config, stream_mode=["custom", "updates"]),
+            run_id,
+            conversation_id,
+        ):
+            yield event
 
-            if not approved:
-                state_ref = suspension_manager.get_suspended_state(conversation_id) if conversation_id else None
-                reject_reason = getattr(state_ref, "reject_reason", None) or "用户取消"
-                state["tool_calls_history"].append({
-                    "tool_name": "medication_consultation",
-                    "arguments": tool_args,
-                    "result_preview": "用药类问题未获确认，已拦截",
-                    "status": "rejected",
-                    "risk_level": "high",
-                    "duration": 0,
-                    "iteration": 1,
-                })
-                yield {
-                    "type": "tool_result",
-                    "tool_name": "medication_consultation",
-                    "status": "rejected",
-                    "error_type": "user_rejected",
-                    "error_message": reject_reason,
-                    "iteration": 1,
-                }
-                yield {"type": "answer", "content": HIGH_RISK_DECLINED_ANSWER, "done": True}
-                yield {
-                    "type": "done",
-                    "iteration_count": 0,
-                    "tool_calls_count": len(state["tool_calls_history"]),
-                    "tool_calls_history": state["tool_calls_history"],
-                }
-                return
+    async def _adapt_stream(self, raw_stream, run_id: str, conversation_id: Optional[str]):
+        """把 LangGraph 的多模式下原始流翻译为前端 SSE 事件协议"""
+        async for mode, data in raw_stream:
+            if mode == "custom":
+                yield data
+            elif mode == "updates":
+                interrupts = data.get("__interrupt__") if isinstance(data, dict) else None
+                if interrupts:
+                    payload = dict(interrupts[0].value or {})
+                    payload["run_id"] = run_id
+                    payload["conversation_id"] = conversation_id
+                    yield payload
 
-            # 本轮已获得用户确认，后续同名工具不再重复询问
-            approved_tool_names.add("medication_consultation")
+        snapshot = await self.graph.aget_state({"configurable": {"thread_id": run_id}})
+        values = snapshot.values or {}
 
-        # 手动执行 ReAct 循环
-        for i in range(self.settings.agent_max_iterations):
-            # 【状态校验中间件】每次迭代前校验并修复状态
-            state, validation_result = AgentStateMiddleware.validate_and_fix(state)
-            if not validation_result.is_valid and validation_result.fixes:
-                logger.info(
-                    f"[状态校验] 第{i+1}轮: "
-                    f"发现{len(validation_result.issues)}个问题，"
-                    f"修复{len(validation_result.fixes)}个"
-                )
+        # 处于挂起状态：本轮尚未结束，不发 answer/done，
+        # 等用户确认后由 resume_stream 继续推流
+        if snapshot.interrupts:
+            return
 
-            # Agent 思考
-            yield {
-                "type": "thought",
-                "content": f"第{i+1}步：分析问题中...",
-                "iteration": i + 1
-            }
+        history = values.get("tool_calls_history", [])
+        final_answer = (
+            values.get("final_answer")
+            or _final_ai_content(values.get("messages", []))
+            or "抱歉，经过多轮查询仍未能完全解答您的问题。建议您咨询专业医生获取更准确的建议。"
+        )
 
-            # 构建系统提示词
-            history_summary = self._summarize_history(state["messages"][:-1])
-            system_msg = SystemMessage(
-                content=SYSTEM_PROMPT.format(
-                    max_iterations=self.settings.agent_max_iterations,
-                    city=city,
-                    history_summary=history_summary,
-                    user_profile=user_profile_text,
-                )
-            )
-
-            # 调用 LLM（token 级流式：正文增量推送，tool_call 增量累积）
-            emitted_delta = False
-            reset_sent = False
-            full_chunk: Optional[AIMessageChunk] = None
-            async for chunk in self.llm_with_tools.astream([system_msg] + state["messages"]):
-                # AIMessageChunk 支持 + 运算：content 拼接、tool_call_chunks 按 index 合并
-                full_chunk = chunk if full_chunk is None else full_chunk + chunk
-
-                if getattr(chunk, "tool_call_chunks", None):
-                    # 一旦转入工具调用，之前误推的正文需要通知前端清空
-                    if emitted_delta and not reset_sent:
-                        reset_sent = True
-                        yield {"type": "answer_reset", "content": ""}
-                elif chunk.content:
-                    text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
-                    emitted_delta = True
-                    yield {"type": "answer_delta", "content": text}
-
-            # 合并完成后还原为标准 AIMessage，保证 .tool_calls / .content 可用
-            response = (
-                message_chunk_to_message(full_chunk)
-                if full_chunk is not None
-                else AIMessage(content="")
-            )
-            state["messages"].append(response)
-            state["iteration_count"] = i + 1
-
-            # 检查是否有工具调用
-            tool_calls = response.tool_calls if hasattr(response, 'tool_calls') and response.tool_calls else []
-
-            if tool_calls:
-                rejected_exit = False
-                for tool_call in tool_calls:
-                    tool_name = tool_call.get("name", "")
-                    tool_args = tool_call.get("args", {})
-
-                    # 发送工具调用事件
-                    yield {
-                        "type": "tool_call",
-                        "tool_name": tool_name,
-                        "tool_description": self._get_tool_description(tool_name),
-                        "arguments": tool_args,
-                        "risk_level": get_tool_risk_level(tool_name).value,
-                        "risk_label": get_risk_label(tool_name),
-                        "iteration": i + 1
-                    }
-
-                    # 【风险分级门禁】高风险工具需要用户确认；本轮已确认过的工具不再重复询问
-                    if is_high_risk(tool_name) and tool_name not in approved_tool_names:
-                        approval_prompt = get_approval_prompt(tool_name)
-                        
-                        # 发送"需要确认"事件
-                        yield {
-                            "type": "approval_required",
-                            "tool_name": tool_name,
-                            "tool_args": tool_args,
-                            "risk_level": "high",
-                            "title": approval_prompt["title"] if approval_prompt else "确认操作",
-                            "message": approval_prompt["message"] if approval_prompt else "是否确认执行此操作？",
-                            "warning": approval_prompt["warning"] if approval_prompt else "",
-                            "confirm_text": approval_prompt["confirm_text"] if approval_prompt else "确认",
-                            "cancel_text": approval_prompt["cancel_text"] if approval_prompt else "取消",
-                            "iteration": i + 1,
-                        }
-
-                        # 挂起等待用户确认
-                        if conversation_id:
-                            logger.info(f"[HITL] 等待用户确认高风险工具: {tool_name}")
-                            approved = await suspension_manager.suspend(
-                                conversation_id=conversation_id,
-                                tool_name=tool_name,
-                                tool_args=tool_args,
-                            )
-                        else:
-                            # 无会话标识则无法挂起等待确认 → fail-closed，按用户拒绝处理
-                            logger.warning(f"[HITL] 缺少 conversation_id，高危工具按拒绝处理: {tool_name}")
-                            approved = False
-
-                        if not approved:
-                            # 用户拒绝或超时 → 返回结构化错误给 Agent
-                            state_ref = suspension_manager.get_suspended_state(conversation_id)
-                            reject_reason = state_ref.reject_reason if state_ref else "用户取消"
-                            
-                            tool_output = (
-                                '{"error": true, "error_type": "user_rejected", '
-                                f'"error_message": "用户拒绝执行此操作：{reject_reason}", '
-                                '"hint": "用户拒绝了该工具调用，可以尝试换一种方式回答，或者建议用户咨询专业医生。"}'
-                            )
-                            
-                            # 将错误加入消息历史
-                            tool_call_id = tool_call.get("id", "")
-                            if not tool_call_id:
-                                tool_call_id = f"call_{uuid.uuid4().hex[:8]}"
-                            state["messages"].append(
-                                ToolMessage(content=tool_output, tool_call_id=tool_call_id)
-                            )
-                            
-                            # 记录工具调用历史
-                            state["tool_calls_history"].append({
-                                "tool_name": tool_name,
-                                "arguments": tool_args,
-                                "result_preview": f"用户拒绝: {reject_reason}",
-                                "status": "rejected",
-                                "risk_level": "high",
-                                "duration": 0,
-                                "iteration": i + 1
-                            })
-                            
-                            # 发送工具结果事件（被拒绝）
-                            yield {
-                                "type": "tool_result",
-                                "tool_name": tool_name,
-                                "status": "rejected",
-                                "risk_level": "high",
-                                "result_preview": f"用户拒绝执行此操作",
-                                "duration": 0,
-                                "iteration": i + 1
-                            }
-                            
-                            # 【拒绝即收口】用户取消后给出固定安全提示并结束本轮，
-                            # 不再让模型用自己的知识把同一问题重新答一遍，避免绕过风险门禁
-                            safe_answer = HIGH_RISK_DECLINED_ANSWER
-                            yield {
-                                "type": "answer",
-                                "content": safe_answer,
-                                "done": True
-                            }
-                            state["final_answer"] = safe_answer
-                            rejected_exit = True
-                            break
-                        
-                    #如果工具是低风险（比如搜个医院），或者用户点了“同意”
-                    # 执行工具（Never-Throw 保证，内部自动重试+纠偏+降级）
-                    # 执行器是同步实现（含 time.sleep 退避），放入线程池避免阻塞事件循环
-                    exec_result: ToolExecutionResult = await asyncio.to_thread(
-                        self.tool_executor.execute, tool_name, tool_args
-                    )
-
-                    # 工具结果（给 Agent 看的内容）
-                    tool_output = exec_result.to_agent_message()
-
-                    # 将工具结果加入消息历史
-                    tool_call_id = tool_call.get("id", "")
-                    if not tool_call_id:
-                        tool_call_id = f"call_{uuid.uuid4().hex[:8]}"
-                    state["messages"].append(
-                        ToolMessage(
-                            content=tool_output,
-                            tool_call_id=tool_call_id
-                        )
-                    )
-
-                    # 记录工具调用历史（更丰富的信息）
-                    state["tool_calls_history"].append({
-                        "tool_name": tool_name,
-                        "arguments": tool_args,
-                        "result_preview": tool_output[:200] + "..." if len(tool_output) > 200 else tool_output,
-                        "status": "success" if exec_result.success else "failed",
-                        "error_type": exec_result.error_type,
-                        "error_message": exec_result.error_message,
-                        "retry_count": exec_result.retry_count,
-                        "used_fallback": exec_result.used_fallback,
-                        "duration": exec_result.duration,
-                        "iteration": i + 1
-                    })
-
-                    # 发送工具结果事件
-                    yield {
-                        "type": "tool_result",
-                        "tool_name": tool_name,
-                        "status": "success" if exec_result.success else "failed",
-                        "error_type": exec_result.error_type,
-                        "retry_count": exec_result.retry_count,
-                        "used_fallback": exec_result.used_fallback,
-                        "result_preview": tool_output[:150] + "..." if len(tool_output) > 150 else tool_output,
-                        "duration": exec_result.duration,
-                        "iteration": i + 1
-                    }
-
-                # 用户取消高风险工具后，跳出 ReAct 循环，直接进入收尾
-                if rejected_exit:
-                    break
-            else:
-                # 没有工具调用，输出最终回答
-                # 流式输出最终答案
-                full_answer = response.content
-                yield {
-                    "type": "answer",
-                    "content": full_answer,
-                    "done": True
-                }
-                break
-        else:
-            # 达到最大迭代次数
-            yield {
-                "type": "answer",
-                "content": "抱歉，经过多轮查询仍未能完全解答您的问题。建议您咨询专业医生获取更准确的建议。",
-                "done": True
-            }
-
-        # 发送完成事件
+        yield {"type": "answer", "content": final_answer, "done": True}
         yield {
             "type": "done",
-            "iteration_count": state["iteration_count"],
-            "tool_calls_count": len(state["tool_calls_history"]),
-            "tool_calls_history": state["tool_calls_history"]
+            "conversation_id": conversation_id,
+            "run_id": run_id,
+            "iteration_count": values.get("iteration_count", 0),
+            "tool_calls_count": len(history),
+            "tool_calls_history": history,
         }
+
+        # 本轮已完成，释放进程内检查点，避免长期运行时内存累积
+        self.checkpointer.delete_thread(run_id)
+
+    async def resume_stream(self, run_id: str, decision: Dict[str, Any],
+                            conversation_id: Optional[str] = None):
+        """用户确认/拒绝后，用 Command(resume=...) 继续被中断的那次运行"""
+        config = {"configurable": {"thread_id": run_id}}
+        async for event in self._adapt_stream(
+            self.graph.astream(Command(resume=decision), config, stream_mode=["custom", "updates"]),
+            run_id,
+            conversation_id,
+        ):
+            yield event
+
+    def get_pending_interrupt(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """读取某次运行中尚未处理的中断载荷；没有则返回 None"""
+        snapshot = self.graph.get_state({"configurable": {"thread_id": run_id}})
+        if not snapshot.interrupts:
+            return None
+        value = snapshot.interrupts[0].value
+        return value if isinstance(value, dict) else {"value": value}
+
 
     def _get_tool_by_name(self, tool_name: str):
         """根据名称获取工具（委托给 tool_executor）"""

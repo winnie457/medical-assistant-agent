@@ -6,6 +6,8 @@ export interface ChatMessage {
   timestamp?: string
   toolCalls?: ToolCallInfo[]
   sources?: SourceInfo[]
+  // 思考中占位状态（前端渲染用）
+  thinking?: boolean
 }
 
 export interface ToolCallInfo {
@@ -42,6 +44,8 @@ export interface StreamEvent {
   iteration?: number
   done?: boolean
   conversation_id?: string
+  // 被中断的那次运行标识，审批续跑时回传
+  run_id?: string
   iteration_count?: number
   tool_calls_count?: number
   tool_calls_history?: ToolCallInfo[]
@@ -56,7 +60,6 @@ export interface StreamEvent {
   confirm_text?: string
   cancel_text?: string
   tool_args?: Record<string, any>
-  conversation_id?: string
 }
 
 export interface ConversationInfo {

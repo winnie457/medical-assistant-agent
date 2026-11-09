@@ -49,63 +49,61 @@ export async function sendMessage(request: ChatRequest): Promise<ChatResponse> {
 }
 
 /**
+ * 消费 SSE 响应流（fetch + ReadableStream）
+ */
+async function consumeSSE(
+  path: string,
+  body: Record<string, any>,
+  onEvent: (event: StreamEvent) => void
+): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  })
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`)
+  }
+
+  const reader = response.body?.getReader()
+  if (!reader) {
+    throw new Error('无法读取响应流')
+  }
+
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue
+      try {
+        onEvent(JSON.parse(line.slice(6)))
+      } catch (e) {
+        console.error('解析SSE事件失败:', e)
+      }
+    }
+  }
+}
+
+/**
  * 发送消息（流式）
  */
 export async function sendMessageStream(
   request: ChatRequest,
   onEvent: (event: StreamEvent) => void
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    // 注意：EventSource 默认只支持 GET，这里改用 fetch + ReadableStream
-    fetch(`${API_BASE_URL}/api/chat/stream`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(request)
-    })
-      .then(async (response) => {
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`)
-        }
-
-        const reader = response.body?.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
-
-        if (!reader) {
-          throw new Error('无法读取响应流')
-        }
-
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-
-          buffer += decoder.decode(value, { stream: true })
-          const lines = buffer.split('\n')
-          buffer = lines.pop() || ''
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const eventData: StreamEvent = JSON.parse(line.slice(6))
-                onEvent(eventData)
-
-                if (eventData.type === 'done') {
-                  resolve()
-                }
-              } catch (e) {
-                console.error('解析SSE事件失败:', e)
-              }
-            }
-          }
-        }
-        resolve()
-      })
-      .catch((error) => {
-        reject(error)
-      })
-  })
+  // 注意：EventSource 默认只支持 GET，这里改用 fetch + ReadableStream
+  return consumeSSE('/api/chat/stream', request, onEvent)
 }
 
 /**
@@ -148,33 +146,36 @@ export async function deleteConversation(conversationId: string): Promise<void> 
 
 /**
  * 确认执行高风险工具（HITL）
+ * 服务端用 Command(resume=...) 续跑被中断的图，因此返回的是继续推送的事件流
  */
-export async function approveTool(conversationId: string): Promise<any> {
-  try {
-    const response = await apiClient.post('/api/chat/approve', {
-      conversation_id: conversationId
-    })
-    return response.data
-  } catch (error: any) {
-    console.error('确认失败:', error)
-    throw new Error(error.response?.data?.detail || error.message || '确认失败')
-  }
+export async function approveTool(
+  runId: string,
+  conversationId: string,
+  userId: string,
+  onEvent: (event: StreamEvent) => void
+): Promise<void> {
+  return consumeSSE(
+    '/api/chat/approve',
+    { conversation_id: conversationId, run_id: runId, user_id: userId },
+    onEvent
+  )
 }
 
 /**
  * 拒绝执行高风险工具（HITL）
  */
-export async function rejectTool(conversationId: string, reason: string = '用户取消'): Promise<any> {
-  try {
-    const response = await apiClient.post('/api/chat/reject', {
-      conversation_id: conversationId,
-      reason: reason
-    })
-    return response.data
-  } catch (error: any) {
-    console.error('拒绝失败:', error)
-    throw new Error(error.response?.data?.detail || error.message || '拒绝失败')
-  }
+export async function rejectTool(
+  runId: string,
+  conversationId: string,
+  userId: string,
+  reason: string,
+  onEvent: (event: StreamEvent) => void
+): Promise<void> {
+  return consumeSSE(
+    '/api/chat/reject',
+    { conversation_id: conversationId, run_id: runId, user_id: userId, reason },
+    onEvent
+  )
 }
 
 /**

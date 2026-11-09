@@ -312,7 +312,7 @@
 import { ref, nextTick, onMounted } from 'vue'
 import { message, Modal } from 'ant-design-vue'
 import { sendMessageStream, getConversations, getConversation, deleteConversation, approveTool, rejectTool, getUserProfile, deleteMemory, clearAllMemories } from '@/services/api'
-import type { ChatMessage, ToolCallInfo, StreamEvent } from '@/types'
+import type { ChatMessage, StreamEvent } from '@/types'
 
 const messagesContainer = ref<HTMLElement | null>(null)
 const inputMessage = ref('')
@@ -331,6 +331,10 @@ const approvalData = ref<{
   iteration: number
 } | null>(null)
 const approvalConversationId = ref('')
+// 被中断的那次运行标识，审批续跑时回传给服务端
+const approvalRunId = ref('')
+// 审批后续跑的事件要回填到同一条助手消息
+const approvalMsgIndex = ref(-1)
 const approvalLoading = ref(false)
 
 // 用户健康画像
@@ -506,7 +510,7 @@ function handleStreamEvent(event: StreamEvent, msgIndex: number) {
       break
 
     case 'approval_required':
-      // 高风险工具需要用户确认 → 弹窗
+      // 高风险操作挂起 → 弹窗；确认/拒绝后由服务端续流继续推送
       approvalData.value = {
         tool_name: event.tool_name || '',
         tool_args: event.tool_args || {},
@@ -517,9 +521,15 @@ function handleStreamEvent(event: StreamEvent, msgIndex: number) {
         cancel_text: event.cancel_text || '取消',
         iteration: event.iteration || 0
       }
-      // 从事件里取 conversation_id（新会话时 currentConversationId 还没设置）
+      // 从事件里取 conversation_id / run_id（新会话时 currentConversationId 还没设置）
       approvalConversationId.value = event.conversation_id || currentConversationId.value || ''
+      if (event.conversation_id) {
+        currentConversationId.value = event.conversation_id
+      }
+      approvalRunId.value = event.run_id || ''
+      approvalMsgIndex.value = msgIndex
       approvalVisible.value = true
+      loadConversations()
       break
 
     case 'tool_result':
@@ -592,30 +602,51 @@ onMounted(() => {
 // ========== 风险分级确认弹窗 ==========
 
 async function handleApprove() {
-  if (!approvalConversationId.value) return
-  
+  if (!approvalRunId.value) return
+
+  const msgIndex = approvalMsgIndex.value
   approvalLoading.value = true
+  approvalVisible.value = false
+  isLoading.value = true
+
   try {
-    await approveTool(approvalConversationId.value)
-    approvalVisible.value = false
+    await approveTool(
+      approvalRunId.value,
+      approvalConversationId.value,
+      userId.value,
+      (event) => handleStreamEvent(event, msgIndex)
+    )
   } catch (e: any) {
     message.error(e.message || '确认失败')
   } finally {
     approvalLoading.value = false
+    isLoading.value = false
+    isTyping.value = false
   }
 }
 
 async function handleReject() {
-  if (!approvalConversationId.value) return
-  
+  if (!approvalRunId.value) return
+
+  const msgIndex = approvalMsgIndex.value
   approvalLoading.value = true
+  approvalVisible.value = false
+  isLoading.value = true
+
   try {
-    await rejectTool(approvalConversationId.value, '用户取消查看用药建议')
-    approvalVisible.value = false
+    await rejectTool(
+      approvalRunId.value,
+      approvalConversationId.value,
+      userId.value,
+      '用户取消查看用药建议',
+      (event) => handleStreamEvent(event, msgIndex)
+    )
   } catch (e: any) {
     message.error(e.message || '操作失败')
   } finally {
     approvalLoading.value = false
+    isLoading.value = false
+    isTyping.value = false
   }
 }
 
