@@ -90,19 +90,50 @@ def is_high_risk(tool_name: str) -> bool:
 # 用药类意图关键词（规则式粗筛）
 # 拦截点如果只绑在“工具调用”上，模型选择直接作答时就会绕过确认门禁，
 # 因此需要在入口先做一次确定性识别
-MEDICATION_INTENT_KEYWORDS = (
-    "药", "服用", "用法", "用量", "剂量", "副作用", "不良反应",
-    "禁忌", "相互作用", "同服", "一起吃", "能不能吃", "停药",
-    "抗生素", "消炎药", "头孢", "布洛芬", "阿莫西林", "对乙酰氨基酚",
-    "感冒药", "退烧药", "止痛药", "哺乳期", "孕妇",
+# 旧版只要出现"药"字就判高危，实测把三类问题误拦了（评测 round2 里误拦 5 条全部来自这里）：
+#   1) 急症："误服安眠药""头孢配酒"——应该走急救，而不是"请确认是否查看用药信息"；
+#   2) 知识类："高血脂需要终身吃药吗"；
+#   3) 资讯类："最近的减肥药新闻"。
+# 新规则：有具体药名时看"问的是什么"，没有药名时只认剂量 / 安全性问题。
+
+DRUG_NAMES = (
+    "阿莫西林", "布洛芬", "头孢", "头孢克肟", "奥美拉唑", "蒙脱石散",
+    "氯雷他定", "二甲双胍", "连花清瘟", "阿司匹林", "对乙酰氨基酚",
+    "氨氯地平", "阿奇霉素", "左氧氟沙星", "甲硝唑", "青霉素",
+    "感冒灵", "板蓝根", "退烧药", "止痛药", "感冒药", "消炎药", "抗生素",
 )
+DOSE_PATTERNS = ("剂量", "用量", "吃几", "一次吃", "一天吃", "几粒", "几片", "多少毫克", "毫克", "mg")
+USAGE_PATTERNS = ("怎么吃", "怎么用", "饭前", "饭后", "空腹", "服用方法", "冲服", "温水送服")
+SAFETY_PATTERNS = (
+    "副作用", "不良反应", "禁忌", "相互作用", "一起吃", "一起喝", "一起",
+    "同服", "停药", "喝酒", "饮酒", "过敏", "哺乳", "怀孕", "孕妇",
+    "孩子", "儿童", "老人", "肝肾",
+)
+ASK_PATTERNS = ("能不能吃", "可以吃", "能吃", "吃吗", "该吃", "要不要吃", "需要吃")
 
 
 def detect_medication_intent(text: str) -> bool:
-    """判断用户问题是否属于用药咨询类（高风险）"""
+    """判断用户问题是否属于用药咨询类（高风险）。
+
+    判定顺序：
+    1. 提到具体药名 → 看是否在问用法 / 剂量 / 安全性 / 能不能吃；
+    2. 没提药名 → 只有明确问剂量或安全性、且确实在说"药"才算。
+    单纯出现"药"字（减肥药新闻、高血脂要不要吃药）不再进入确认流程。
+    """
     if not text:
         return False
-    return any(keyword in text for keyword in MEDICATION_INTENT_KEYWORDS)
+
+    has_drug = any(name in text for name in DRUG_NAMES)
+    has_dose = any(pattern in text for pattern in DOSE_PATTERNS)
+    has_usage = any(pattern in text for pattern in USAGE_PATTERNS)
+    has_safety = any(pattern in text for pattern in SAFETY_PATTERNS)
+    asks_taking = any(pattern in text for pattern in ASK_PATTERNS)
+
+    if has_drug:
+        return has_dose or has_usage or has_safety or asks_taking
+
+    mentions_medicine = "药" in text
+    return mentions_medicine and (has_dose or has_safety)
 
 
 def is_medium_risk(tool_name: str) -> bool:
