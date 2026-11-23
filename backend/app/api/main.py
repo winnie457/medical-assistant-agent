@@ -77,6 +77,12 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """应用关闭事件"""
+    try:
+        from ..agents.checkpointer import get_checkpointer_provider
+
+        await get_checkpointer_provider().aclose()
+    except Exception:
+        pass
     print("\n" + "="*60)
     print("👋 应用正在关闭...")
     print("="*60 + "\n")

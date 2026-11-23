@@ -1,5 +1,6 @@
 """智能就医助手 ReAct Agent - 基于 LangGraph 实现"""
 
+import asyncio
 import json
 import uuid
 import logging
@@ -37,6 +38,9 @@ from ..tools.risk_level import (
     detect_medication_intent,
 )
 from .state_middleware import AgentStateMiddleware
+from .emergency import build_emergency_answer, detect_emergency
+from .output_guard import enforce_final_answer
+from .checkpointer import get_checkpointer_provider
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +103,7 @@ SYSTEM_PROMPT = """你是一位专业、贴心的智能就医助手，名叫"医
 3. 遇到紧急情况（如胸痛、呼吸困难、大出血、昏迷等），立即建议拨打120急救电话
 4. 回答要专业、准确，但又要通俗易懂、温暖贴心
 5. 不确定的事情，建议咨询专业医生
+6. **急症优先**：判定为急症时不要调用任何工具、不要追问细节，直接给出拨打 120 的急救指引
 
 **工具使用原则：**
 - 先理解用户的问题，再决定是否需要调用工具
@@ -107,6 +112,9 @@ SYSTEM_PROMPT = """你是一位专业、贴心的智能就医助手，名叫"医
 - **例外：涉及药物的问题（药品名、用法用量、相互作用、禁忌、副作用）必须先调用「用药咨询」工具，禁止直接凭自身知识作答**
 - 同一个问题不要反复调用相同的工具
 - 最多调用{max_iterations}次工具，之后必须给出最终回答
+- 工具数据有边界：医院搜索只返回名称/地址/电话等 POI 信息，不要补充科室排名、号源、专家、口碑；需要时直说未获取
+- 路线工具失败或降级时，只说明未获取到实时路线，不要自行编排换乘方案、用时或距离
+- 资讯检索为空时，明确说明未检索到，不要用通用知识补成"最新新闻"
 
 **风险分级原则：**
 - 不同类型的医疗建议风险等级不同
@@ -189,22 +197,57 @@ class MedicalAgent:
         self.tools = get_tools()
         self.settings = get_settings()
         self.llm_with_tools = self.llm.bind_tools(self.tools)
-        self.checkpointer = self._build_checkpointer()
-        self.graph = self._build_graph()
+        # 图与 checkpointer 懒构建：AsyncSqliteSaver 需要先 await 建表，
+        # 不能在同步的 __init__ 里完成（见 checkpointer.py 的说明）。
+        self._checkpointer_provider = get_checkpointer_provider()
+        self.checkpointer = None
+        self.graph = None
+        self._graph_lock = asyncio.Lock()
         # Never-Throw 工具执行器（带降级方案）
         self.tool_executor = NeverThrowToolExecutor(
             tools=self.tools,
             fallback_providers=ToolFallbackProvider.get_all_fallbacks()
         )
 
-    def _build_checkpointer(self):
-        """创建会话状态检查点存储。
+    async def ensure_graph(self):
+        """懒构建状态图。
 
-        当前使用进程内 InMemorySaver，把 thread_id ↔ 会话状态的链路打通；
-        后续可替换为 AsyncSqliteSaver 等持久化实现，使进程重启后会话与
-        interrupt 中断状态仍可恢复。
+        第一次真正跑图时才初始化 checkpointer（SQLite 建表是异步的），
+        之后复用同一个 saver，保证同一进程内所有运行共享一份持久化状态。
         """
-        return InMemorySaver()
+        if self.graph is not None:
+            return self.graph
+        async with self._graph_lock:
+            if self.graph is None:
+                self.checkpointer = await self._checkpointer_provider.get()
+                self.graph = self._build_graph()
+                logger.info(
+                    "[Agent] 状态图就绪，checkpointer=%s（持久化=%s）",
+                    self._checkpointer_provider.kind,
+                    self._checkpointer_provider.persistent,
+                )
+        return self.graph
+
+    async def _delete_thread(self, run_id: str) -> None:
+        """释放某次运行的检查点（同步/异步 saver 都兼容）。"""
+        try:
+            if hasattr(self.checkpointer, "adelete_thread"):
+                await self.checkpointer.adelete_thread(run_id)
+            elif hasattr(self.checkpointer, "delete_thread"):
+                self.checkpointer.delete_thread(run_id)
+        except Exception as exc:  # 清理失败不影响主流程
+            logger.debug("[Agent] 清理检查点失败(可忽略): %s", exc)
+
+    async def aclose(self) -> None:
+        """关闭持久化连接。
+
+        aiosqlite 在后台线程里跑事件循环，连接不关则进程无法退出：
+        CLI/压测脚本收尾、FastAPI shutdown 都要调用这里。
+        """
+        try:
+            await self._checkpointer_provider.aclose()
+        except Exception as exc:
+            logger.debug("[Agent] 关闭 checkpointer 失败(可忽略): %s", exc)
 
     def _build_graph(self) -> StateGraph:
         """构建 LangGraph 状态图
@@ -258,16 +301,39 @@ class MedicalAgent:
     def _precheck_node(self, state: AgentState) -> Dict[str, Any]:
         """入口前置门禁
 
-        只拦工具调用是不够的：模型可以选择"直接作答"而绕过确认，
-        因此在进入 ReAct 循环前先做一次确定性的用药意图识别。
-        - 交互入口（流式）：interrupt 挂起，等待用户确认
-        - 非交互入口（非流式）：没有确认通道 → fail-closed 直接收口
+        两级判定，顺序不能反：
+
+        1. **急症优先**：命中急症规则（误服、卒中、抽搐、大出血、头孢配酒等）时
+           直接给出 120 急救指引并结束本轮。急症问题里常常带"药"字，若先走用药
+           门禁，用户会收到"请确认是否查看用药信息"——这是安全优先级错误。
+        2. **用药门禁**：只拦工具调用是不够的，模型可以选择"直接作答"而绕过确认，
+           因此在进入 ReAct 循环前再做一次确定性的用药意图识别。
+           - 交互入口（流式）：interrupt 挂起，等待用户确认
+           - 非交互入口（非流式）：没有确认通道 → fail-closed 直接收口
         """
         text = ""
         for msg in reversed(state["messages"]):
             if isinstance(msg, HumanMessage):
                 text = msg.content if isinstance(msg.content, str) else str(msg.content)
                 break
+
+        emergency = detect_emergency(text)
+        if emergency:
+            answer = build_emergency_answer(emergency)
+            logger.info(f"[急症] 命中 {emergency}，跳过用药门禁直接给出急救指引")
+            return {
+                "messages": [AIMessage(content=answer)],
+                "final_answer": answer,
+                "tool_calls_history": [{
+                    "tool_name": "emergency_triage",
+                    "arguments": {"query": text},
+                    "result_preview": f"急症规则命中: {emergency}",
+                    "status": "emergency_shortcut",
+                    "risk_level": "high",
+                    "duration": 0,
+                    "iteration": 1,
+                }],
+            }
 
         if not detect_medication_intent(text):
             return {}
@@ -566,9 +632,9 @@ class MedicalAgent:
 
         return f"已进行{len(user_msgs)}轮对话"
 
-    def chat(self, message: str, history: Optional[List[BaseMessage]] = None,
-             city: str = "北京", user_id: str = "default",
-             conversation_id: Optional[str] = None) -> Dict[str, Any]:
+    async def chat(self, message: str, history: Optional[List[BaseMessage]] = None,
+                   city: str = "北京", user_id: str = "default",
+                   conversation_id: Optional[str] = None) -> Dict[str, Any]:
         """
         非流式对话
 
@@ -606,23 +672,29 @@ class MedicalAgent:
 
         # 每次请求使用独立的 run_id 作为 thread_id：
         # 历史消息由入口整表传入，避免同一会话多轮之间消息重复累积
+        await self.ensure_graph()
         run_id = f"sync-{uuid.uuid4().hex[:12]}"
         config = {"configurable": {"thread_id": run_id}}
 
         try:
-            result = self.graph.invoke(initial_state, config)
+            result = await self.graph.ainvoke(initial_state, config)
         finally:
             # 非流式不会产生 interrupt，本轮结束后即可释放检查点
-            self.checkpointer.delete_thread(run_id)
+            await self._delete_thread(run_id)
 
         final_messages = result["messages"]
         final_answer = result.get("final_answer") or _final_ai_content(final_messages)
+        # 与非流式保持同一套出口校验
+        final_answer, guard_issues = enforce_final_answer(
+            final_answer, result.get("tool_calls_history", [])
+        )
 
         return {
             "answer": final_answer or "抱歉，我暂时无法回答这个问题。",
             "messages": final_messages,
             "tool_calls_history": result.get("tool_calls_history", []),
-            "iteration_count": result.get("iteration_count", 0)
+            "iteration_count": result.get("iteration_count", 0),
+            "guard_issues": guard_issues,
         }
 
     async def chat_stream(self, message: str, history: Optional[List[BaseMessage]] = None,
@@ -655,6 +727,7 @@ class MedicalAgent:
             "approved_high_risk": False,
         }
 
+        await self.ensure_graph()
         run_id = f"run-{uuid.uuid4().hex[:12]}"
         config = {"configurable": {"thread_id": run_id}}
 
@@ -693,6 +766,9 @@ class MedicalAgent:
             or "抱歉，经过多轮查询仍未能完全解答您的问题。建议您咨询专业医生获取更准确的建议。"
         )
 
+        # 第三层护栏：工具没给的信息不许"补"，命中则在答案末尾追加限定说明
+        final_answer, guard_issues = enforce_final_answer(final_answer, history)
+
         yield {"type": "answer", "content": final_answer, "done": True}
         yield {
             "type": "done",
@@ -701,14 +777,16 @@ class MedicalAgent:
             "iteration_count": values.get("iteration_count", 0),
             "tool_calls_count": len(history),
             "tool_calls_history": history,
+            "guard_issues": guard_issues,
         }
 
-        # 本轮已完成，释放进程内检查点，避免长期运行时内存累积
-        self.checkpointer.delete_thread(run_id)
+        # 本轮已完成，释放本次运行的检查点，避免长期运行时堆积
+        await self._delete_thread(run_id)
 
     async def resume_stream(self, run_id: str, decision: Dict[str, Any],
                             conversation_id: Optional[str] = None):
         """用户确认/拒绝后，用 Command(resume=...) 继续被中断的那次运行"""
+        await self.ensure_graph()
         config = {"configurable": {"thread_id": run_id}}
         async for event in self._adapt_stream(
             self.graph.astream(Command(resume=decision), config, stream_mode=["custom", "updates"]),
@@ -717,9 +795,14 @@ class MedicalAgent:
         ):
             yield event
 
-    def get_pending_interrupt(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """读取某次运行中尚未处理的中断载荷；没有则返回 None"""
-        snapshot = self.graph.get_state({"configurable": {"thread_id": run_id}})
+    async def get_pending_interrupt(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """读取某次运行中尚未处理的中断载荷；没有则返回 None。
+
+        走 `aget_state`，因为 checkpointer 是异步实现；只要 checkpoint 落盘，
+        换一个进程也能查到这次运行是否还在等确认。
+        """
+        await self.ensure_graph()
+        snapshot = await self.graph.aget_state({"configurable": {"thread_id": run_id}})
         if not snapshot.interrupts:
             return None
         value = snapshot.interrupts[0].value

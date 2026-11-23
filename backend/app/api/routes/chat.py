@@ -9,6 +9,7 @@ from ...models.schemas import ChatRequest
 from ...agents.medical_agent import get_medical_agent
 from ...services.conversation_service import get_conversation_manager
 from ...services.memory_service import update_memory_after_chat
+from ...services import run_registry
 from ...memory.memory_manager import get_memory_manager
 
 router = APIRouter(prefix="/chat", tags=["对话"])
@@ -74,6 +75,12 @@ async def _stream_sse(events, conversation_id: str, user_id: str, conv_manager, 
             })
 
         elif event_type == "approval_required":
+            run_registry.record_run(
+                event.get("run_id", ""),
+                conversation_id,
+                run_registry.INTERRUPTED,
+                detail="等待用户确认高风险操作",
+            )
             yield _sse({
                 "type": "approval_required",
                 "conversation_id": event.get("conversation_id") or conversation_id,
@@ -120,6 +127,12 @@ async def _stream_sse(events, conversation_id: str, user_id: str, conv_manager, 
 
         elif event_type == "done":
             conv_manager.add_message(conversation_id, "assistant", full_answer)
+            run_registry.record_run(
+                event.get("run_id", ""),
+                conversation_id,
+                run_registry.COMPLETED,
+                detail="本轮完成",
+            )
             yield _sse({
                 "type": "done",
                 "conversation_id": conversation_id,
@@ -157,9 +170,8 @@ async def chat(request: ChatRequest):
         # 获取历史消息
         history = conv_manager.get_langchain_messages(conversation_id)
 
-        # 调用 Agent（graph.invoke 为同步阻塞实现，放入线程池避免阻塞事件循环）
-        result = await asyncio.to_thread(
-            agent.chat,
+        # 调用 Agent（chat 已改为 async，内部走 ainvoke；不再需要线程池）
+        result = await agent.chat(
             message=request.message,
             history=history,
             city=request.city or "北京",
@@ -363,7 +375,7 @@ async def approve_tool(request: ApprovalRequest):
     """用户确认：用 Command(resume=...) 续跑被中断的图，并以 SSE 继续推流"""
     agent = get_medical_agent()
 
-    if not agent.get_pending_interrupt(request.run_id):
+    if not await agent.get_pending_interrupt(request.run_id):
         raise HTTPException(
             status_code=404,
             detail="该运行不在等待确认状态，可能已超时或已处理",
@@ -396,7 +408,7 @@ async def reject_tool(request: RejectRequest):
     """用户拒绝：恢复中断，由门禁节点直接收口并返回安全提示"""
     agent = get_medical_agent()
 
-    if not agent.get_pending_interrupt(request.run_id):
+    if not await agent.get_pending_interrupt(request.run_id):
         raise HTTPException(
             status_code=404,
             detail="该运行不在等待确认状态，可能已超时或已处理",
@@ -418,6 +430,28 @@ async def reject_tool(request: RejectRequest):
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
+
+
+@router.get(
+    "/runs/{run_id}",
+    summary="查询运行状态",
+    description="跨进程查询某次运行的状态与待确认内容（服务重启后依然有效）"
+)
+async def get_run_status(run_id: str):
+    """按 run_id 查询：running / interrupted / completed / failed。"""
+    agent = get_medical_agent()
+    record = run_registry.get_run(run_id)
+    pending = await agent.get_pending_interrupt(run_id)
+    if record is None and pending is None:
+        raise HTTPException(status_code=404, detail="未找到该运行记录")
+    return {
+        "run_id": run_id,
+        "status": record["status"] if record else ("interrupted" if pending else "unknown"),
+        "conversation_id": record["conversation_id"] if record else None,
+        "detail": record["detail"] if record else "",
+        "updated_at": record["updated_at"] if record else None,
+        "pending": pending,
+    }
 
 
 @router.delete(
