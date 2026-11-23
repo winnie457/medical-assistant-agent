@@ -1,290 +1,247 @@
-# 🏥 医小助 - 智能就医助手
+# 智能就医助手 · Medical Assistant Agent
 
-> 基于 LangGraph ReAct Agent 的智能就医助手，支持症状分析、医院搜索、科室导诊、用药咨询等 7+ 医疗工具。
+> 基于 LangGraph 的 ReAct 医疗工具调用 Agent：**三层护栏 · 有状态 · 可离线评测**
 
-## ✨ 项目特色
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)
+![Vue](https://img.shields.io/badge/Vue-3.5-42B883?logo=vue.js&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-### 🔧 核心技术
-- **ReAct Agent 架构** — 基于 LangGraph 实现，自主思考、工具调用、结果观察的完整循环
-- **7+ 医疗工具** — 症状分析、医院搜索、科室导诊、医疗知识、路线规划、用药咨询、健康资讯
-- **流式对话** — SSE 流式输出，实时展示思考过程和工具调用
-- **多轮对话记忆** — 完整的会话管理，支持历史对话
+面向普通用户的智能就医助手：用户描述症状或用药疑问，Agent 自主决定调用哪个医疗工具，并在高风险环节强制人工确认。
 
-### 🎯 为什么用 ReAct 而不是流水线？
+这个项目想解决三个具体问题：
 
-| 对比项 | 流水线模式（旧） | ReAct 模式（新） |
-|--------|-----------------|-----------------|
-| 工具选择 | 固定规则，硬编码 | LLM 自主决策 |
-| 灵活性 | 差，只能处理预设场景 | 强，可处理复杂问题 |
-| 工具调用次数 | 固定 | 动态，按需调用 |
-| 回答质量 | 中等（~70%） | 较高（~85%+） |
-| 错误恢复 | 无，失败就结束 | 有，可重试和调整 |
+1. **通用大模型会给出没有依据的医疗建议** → 出口做确定性校验，工具没返回的信息不允许写进答案；
+2. **就医是多步骤任务**（症状 → 科室 → 医院 → 路线）→ 用 ReAct 状态图做工具编排；
+3. **用药建议风险高**，不能让模型自主给出 → 三级风险分级 + 人工确认，且急症优先级高于用药门禁。
 
-详见 [评估结果](#-评估对比)。
+---
 
-## 🏗️ 项目架构
+## 核心特性
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    前端 (Vue3 + Ant Design)              │
-│  左侧边栏（会话列表）    |    右侧聊天界面              │
-│  - 新建咨询              |    - 消息展示                │
-│  - 历史会话              |    - 工具调用可视化          │
-│  - 城市切换              |    - 流式输出                │
-├──────────────────────────────────────────────────────────┤
-│                    后端 API (FastAPI)                    │
-│  /api/chat          — 对话接口（流式/非流式）            │
-│  /api/evaluation    — 评估对比接口                       │
-├──────────────────────────────────────────────────────────┤
-│                  Agent 层 (LangGraph)                    │
-│  ┌──────────────────────────────────────────────────┐    │
-│  │  🏥 医小助 ReAct Agent                           │    │
-│  │  ┌──────┐   ┌──────┐   ┌──────┐   ┌──────┐     │    │
-│  │  │ 思考 │ → │ 工具 │ → │ 观察 │ → │ 回答 │ ... │    │
-│  │  └──────┘   └──────┘   └──────┘   └──────┘     │    │
-│  └──────────────────────────────────────────────────┘    │
-├──────────────────────────────────────────────────────────┤
-│                       工具层 (7 个)                      │
-│  🩺 symptom_analyzer       症状分析与就医建议            │
-│  🏥 hospital_search         医院搜索                      │
-│  📋 department_guide        科室导诊                      │
-│  📚 medical_knowledge       医疗健康知识库                │
-│  🗺️ route_to_hospital       就医路线规划                  │
-│  💊 medication_consultation 用药咨询                      │
-│  📰 health_news_search      健康资讯搜索                  │
-└──────────────────────────────────────────────────────────┘
-```
+| 能力 | 做法 | 效果 |
+| --- | --- | --- |
+| **工具编排** | LangGraph 手写 ReAct 状态图（`precheck → agent ⇄ approval → tools`），7 个医疗工具按需调用，单轮最多 10 次迭代 | 工具选择 micro **F1 0.906** |
+| **风险拦截** | 按医疗后果分低/中/高三级；用药执行前 `interrupt` 挂起确认，拒绝即收口；非流式入口 fail-closed | 192 条可判定用例**零误拦、零漏放** |
+| **急症优先** | 误服、卒中、抽搐、大出血、头孢配酒等规则先于用药判定，命中直接给 120 并跳过确认 | 8/8 急症用例走急救话术 |
+| **幻觉治理** | 出口校验三类无依据断言（排名/号源、工具失败后的距离时长、缺医嘱的剂量），命中追加来源声明 | 200 条中命中 36 条并全部补正 |
+| **容错** | Never-Throw 执行器：参数纠偏 → 指数退避重试 → 降级兜底 → 结构化错误回传模型 | 工具失败不中断会话 |
+| **状态与恢复** | 会话、运行记录与 LangGraph checkpoint 落 SQLite，重启后按 `run_id` 续跑中断的确认 | 跨进程恢复 **5/5** |
+| **可复现评测** | 200 条多轮 Golden Set、12 类场景、确定性指标 + Wilson 95% CI + LLM 评审 | 任务完成率 **90.5%** |
 
-## 📁 项目结构
+## 效果数据
 
-```
-Intelligent-Medical-Assistant/
-├── backend/                          # 后端
-│   ├── app/
-│   │   ├── agents/
-│   │   │   └── medical_agent.py      # ReAct Agent (LangGraph)
-│   │   ├── tools/                     # 7个医疗工具
-│   │   │   ├── symptom_analyzer.py
-│   │   │   ├── hospital_search.py
-│   │   │   ├── department_guide.py
-│   │   │   ├── medical_knowledge.py
-│   │   │   ├── route_planner.py
-│   │   │   ├── medication_consultation.py
-│   │   │   └── health_news.py
-│   │   ├── services/
-│   │   │   ├── llm_service.py         # LLM 服务
-│   │   │   └── conversation_service.py # 会话管理
-│   │   ├── evaluation/
-│   │   │   └── agent_evaluator.py     # 对比评估模块
-│   │   ├── api/
-│   │   │   ├── main.py                # FastAPI 入口
-│   │   │   └── routes/
-│   │   │       ├── chat.py            # 对话 API（含流式）
-│   │   │       └── evaluation.py      # 评估 API
-│   │   ├── models/
-│   │   │   └── schemas.py             # 数据模型
-│   │   └── config.py                  # 配置管理
-│   ├── requirements.txt
-│   ├── .env.example
-│   └── run.py
-└── frontend/                         # 前端
-    ├── src/
-    │   ├── views/
-    │   │   └── Home.vue               # 聊天主界面
-    │   ├── services/
-    │   │   └── api.ts                 # API 服务
-    │   ├── types/
-    │   │   └── index.ts               # 类型定义
-    │   ├── App.vue
-    │   └── main.ts
-    └── package.json
-```
+评测集：200 条多轮用例、12 类场景；被测模型 DeepSeek-chat，temperature=0。评测方法与指标定义见 [`backend/evaluation/README.md`](backend/evaluation/README.md)；每次运行的完整报告（逐条回答、失败原因、混淆矩阵）输出到 `backend/evaluation/reports/<run>/`，该目录不入库。
 
-## 🚀 快速开始
+| 指标 | 结果 | 口径 |
+| --- | --- | --- |
+| 任务完成率 | **90.5%**（181/200，95% CI 85.6%~93.8%） | 硬约束全部满足；三次运行 89.5% / 90.5% / 91.0% |
+| 工具选择 | P 0.896 / R 0.915 / **F1 0.906** | micro 统计；被门禁拦下的不算调用 |
+| 风险拦截 | TP 48 / FP 0 / FN 0 | 48 条应确认 + 144 条不应确认 |
+| 输出护栏命中 | 36 / 200 | 命中即追加来源声明 |
+| 首 token 延迟 | P50 634ms / P95 6.7s | 200 条评测集统计 |
+| 并发（50 路） | 100% 成功，0 错误 | 单机进程内压测，吞吐 6.12 req/s |
 
-### 1. 环境准备
+复现：
 
 ```bash
-# Python 3.10+
-# Node.js 18+
+cd backend
+python -m evaluation.run_eval --judge llm --out evaluation/reports/round8   # 200 条全量评测
+python -m evaluation.recovery_bench --cases 5                               # 跨进程中断恢复
+python -m evaluation.concurrency_bench --concurrency 50                     # 并发压测
 ```
 
-### 2. 后端启动
+---
+
+## 架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        前端 (Vue3 + Vite)                    │
+│              聊天界面 / 工具调用面板 / 风险确认弹窗            │
+└───────────────────────┬─────────────────────────────────────┘
+                        │ HTTP (SSE 流式 / REST 非流式)
+┌───────────────────────▼─────────────────────────────────────┐
+│                     FastAPI 接入层                            │
+│  /chat  /chat/stream  /approve  /reject  /runs/{run_id}      │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+┌───────────────────────▼─────────────────────────────────────┐
+│                MedicalAgent (LangGraph 状态图)                │
+│                                                             │
+│   ┌──────────┐   ┌───────┐   ┌──────────┐   ┌───────┐       │
+│   │ precheck │──▶│ agent │⇄▶│ approval │──▶│ tools │──▶ END │
+│   │急症+用药  │   │ (LLM) │   │(风险门禁) │   │(执行) │       │
+│   └──────────┘   └───────┘   └──────────┘   └───────┘       │
+│                                                             │
+│   三层护栏：入口（急症 + 用药意图）/ 中段（三级风险 + 确认）    │
+│             出口（事实性断言校验）                            │
+└───────────────────────┬─────────────────────────────────────┘
+                        │
+        ┌───────────────┼─────────────────┬──────────────────┐
+        ▼               ▼                 ▼                  ▼
+   7 个医疗工具      LLM(DeepSeek)    长期记忆(JSON)      会话/运行/中断态
+  症状/医院/科室/    OpenAI 兼容        MemoryManager       SQLite
+  知识/路线/用药/资讯                 + 冲突消解      (app.db + checkpoints.sqlite)
+```
+
+一次请求的完整链路：
+
+1. 取会话历史（SQLite）与用户健康画像，登记 `run_id`；
+2. `precheck`：**先判急症**（命中直接 120 并结束），再判用药意图（流式挂起确认 / 非流式 fail-closed）；
+3. `agent`：状态校验 → 拼 Prompt → 流式调模型 → 输出 `thought / tool_call / answer_delta`；
+4. `approval`：高风险工具挂起，用户确认后 `Command(resume)` 续跑；
+5. `tools`：Never-Throw 执行器（纠偏 → 重试 → 降级）；
+6. 循环直到无工具调用或达到迭代上限；
+7. 出口护栏校验 → 推 `answer` + `done`（带 `guard_issues`）→ 落库、异步抽取记忆。
+
+---
+
+## 快速开始
+
+### 1. 后端
 
 ```bash
 cd backend
 
-# 创建虚拟环境
 python -m venv venv
-venv\Scripts\activate  # Windows
+venv\Scripts\activate          # Windows
+# source venv/bin/activate     # macOS / Linux
 
-# 安装依赖
 pip install -r requirements.txt
-
-# 配置环境变量
-copy .env.example .env
-# 编辑 .env，填入 OPENAI_API_KEY 等
-
-# 启动服务
-python run.py
+copy .env.example .env          # 填入模型与地图 API Key
+python run.py                   # http://localhost:8000
 ```
 
-后端服务将在 http://localhost:8000 启动
+依赖里已包含 `langgraph-checkpoint-sqlite` 与 `aiosqlite`。缺少这两个包时，Agent 会自动降级为进程内存储（重启后中断态丢失），启动日志会出现 `[checkpointer] SQLite 不可用 ...` 告警。
 
-API 文档：http://localhost:8000/docs
-
-### 3. 前端启动
+### 2. 前端
 
 ```bash
 cd frontend
-
-# 安装依赖
 npm install
-
-# 启动开发服务器
-npm run dev
+npm run dev                     # http://localhost:5173
 ```
 
-前端将在 http://localhost:5173 启动
+`.env` 里配置 `VITE_API_BASE_URL`（默认指向 `http://localhost:8000`）。
 
-## 🧠 ReAct Agent 工作原理
+### 3. 环境变量
 
-### 什么是 ReAct？
+| 变量 | 说明 | 必填 |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | 模型 Key（默认对接 DeepSeek 的 OpenAI 兼容端点） | ✅ |
+| `OPENAI_BASE_URL` | 例如 `https://api.deepseek.com/v1` | ✅ |
+| `OPENAI_MODEL` | 例如 `deepseek-chat` | ✅ |
+| `AMAP_API_KEY` | 高德 Web 服务 Key，用于医院搜索与路线规划 | 建议 |
+| `TAVILY_API_KEY` | 资讯检索（缺失时回落到搜索降级） | 可选 |
+| `AGENT_MAX_ITERATIONS` | 单轮最大迭代次数，默认 10 | 可选 |
+| `CORS_ORIGINS` | 允许的前端来源，逗号分隔 | 可选 |
+| `APP_DB_PATH` | 会话库路径，默认 `backend/data/app.db` | 可选 |
 
-ReAct = **Reasoning + Acting**（推理 + 行动）
+---
+
+## 项目结构
 
 ```
-用户问题
-    ↓
-┌─────────────────────────────────────┐
-│  思考 (Thought)                     │
-│  分析问题，决定下一步做什么          │
-└─────────────────────────────────────┘
-    ↓
-┌─────────────────────────────────────┐
-│  行动 (Action)                      │
-│  选择并调用合适的工具                │
-└─────────────────────────────────────┘
-    ↓
-┌─────────────────────────────────────┐
-│  观察 (Observation)                 │
-│  查看工具返回的结果                  │
-└─────────────────────────────────────┘
-    ↓
-  信息足够了吗？
-    ├── 是 → 生成最终回答
-    └── 否 → 回到思考步骤，继续循环
+backend/
+├── app/
+│   ├── agents/
+│   │   ├── medical_agent.py      # 状态图、precheck/approval/tools 节点、流式协议
+│   │   ├── emergency.py          # 急症规则与急救话术
+│   │   ├── output_guard.py       # 出口护栏：事实性断言校验
+│   │   ├── checkpointer.py       # SQLite checkpointer（缺依赖时降级）
+│   │   └── state_middleware.py   # 状态校验与自动修复
+│   ├── tools/                    # 7 个医疗工具 + Never-Throw 执行器 + 风险分级
+│   ├── memory/                   # 长期健康画像：提取、冲突消解
+│   ├── services/                 # 会话（SQLite）、运行记录、LLM、记忆后台任务
+│   ├── storage/db.py             # SQLite 连接与建表
+│   └── api/                      # FastAPI 入口与路由
+├── evaluation/                   # 200 条 Golden Set、指标、报告、基准脚本
+├── tests/                        # 不依赖网络的回归测试
+└── requirements.txt
+frontend/
+└── src/                          # Vue3 + TypeScript 聊天界面
 ```
 
-### LangGraph 实现
+---
 
-```python
-# 状态图结构
-agent (思考决策)
-  ↓
-[条件判断] → 有工具调用?
-  ├── 是 → tools (执行工具) → agent
-  └── 否 → END (结束)
-```
+## 设计要点
 
-## 🔧 工具列表
+### 1. ReAct 状态图，而不是现成 Agent
 
-| 工具 | 说明 | 适用场景 |
-|------|------|----------|
-| 🩺 symptom_analyzer | 症状分析 | 描述症状，获取初步分析和就医建议 |
-| 🏥 hospital_search | 医院搜索 | 查找附近的医院、三甲医院 |
-| 📋 department_guide | 科室导诊 | 不知道挂什么科，智能推荐 |
-| 📚 medical_knowledge | 医疗知识 | 疾病介绍、治疗、预防知识 |
-| 🗺️ route_to_hospital | 路线规划 | 规划去医院的交通路线 |
-| 💊 medication_consultation | 用药咨询 | 药品用法、副作用、注意事项 |
-| 📰 health_news_search | 健康资讯 | 最新健康新闻和科普 |
+用 `StateGraph` 显式建模「预检 → 决策 ⇄ 确认 → 执行」，而不是调 `create_react_agent`。原因是需要在标准 ReAct 循环里插入两个非标准节点：
 
-## 📊 评估对比
+- `precheck`：入口确定性判断（急症 / 用药），堵住"模型不调工具、直接凭自身知识作答"的绕过路径；
+- `approval`：工具级风险门禁，模型真要调高风险工具时再拦一次。
 
-### 评估指标
+流式与非流式共用同一张图，靠 `state["interactive"]` 区分是否有确认通道。
 
-| 指标 | 流水线模式 | ReAct 模式 | 提升 |
-|------|-----------|-----------|------|
-| 回答质量 | ~70% | ~85% | **+15%** |
-| 工具选择准确率 | ~65% | ~90% | **+25%** |
-| 平均工具调用数 | 1.8 | 2.2 | +0.4 |
-| 成功率 | 80% | 95% | **+15%** |
+### 2. 三层护栏
 
-### 运行评估
+| 层 | 位置 | 拦什么 |
+| --- | --- | --- |
+| 入口 | `precheck` | 急症（直接 120）、用药意图（挂起确认 / fail-closed） |
+| 中段 | `approval` | 模型选择的高风险工具，`interrupt` 挂起等确认 |
+| 出口 | `output_guard` | 工具没返回却写出的事实性断言，追加来源声明 |
 
-```bash
-# 方式1：API 调用
-POST http://localhost:8000/api/evaluation/run
+急症判定放在用药门禁**之前**：像"误服了半瓶安眠药"这种问题本身带"药"字，如果先走用药门禁，用户只会看到"请确认是否查看用药信息"，而正确动作是立即拨打 120。
 
-# 方式2：直接运行脚本
-python -m app.evaluation.agent_evaluator
-```
+### 3. 状态与恢复
 
-### 测试用例覆盖
+- `data/app.db`：会话、消息、运行记录（`running → interrupted → completed/failed`）；
+- `data/checkpoints.sqlite`：LangGraph checkpoint，按 `thread_id = run_id` 存中断状态；
+- `GET /api/chat/runs/{run_id}` 可跨进程查询运行状态与待确认内容。
 
-- ✅ 简单症状咨询
-- ✅ 医院搜索
-- ✅ 科室导诊
-- ✅ 用药咨询
-- ✅ 医疗知识查询
-- ✅ 路线规划
-- ✅ 多工具组合任务
-- ✅ 复杂问诊
-- ✅ 健康资讯
-- ✅ 纯知识问答（无需工具）
+LangGraph 1.x 的同步与异步 checkpointer 是两套接口，而流式链路本来就是异步，因此统一使用 `AsyncSqliteSaver`，`chat()` 也改为 async 走 `ainvoke`，保证两条链路共用同一份状态。
 
-## 🎨 界面预览
+实测：进程 A 制造挂起后退出，进程 B 按 `run_id` 续跑，**5/5 成功**。
 
-### 聊天界面
-- 左侧：会话列表 + 城市选择
-- 右侧：对话区域 + 工具调用可视化
-- 支持流式输出，实时展示思考过程
+### 4. 记忆分层
 
-### 工具调用展示
-- 可展开/收起的工具卡片
-- 显示工具名称、参数、执行结果
-- 成功/失败状态标识
-- 执行耗时统计
+短期记忆是会话消息窗口；长期记忆是用户健康画像（JSON 持久化），每轮对话结束后异步抽取健康信息，按「否定 > 置信度 > 时间」的规则做冲突消解，避免"我青霉素不过敏了"这类新信息被旧记忆覆盖，或反过来污染后续建议。
 
-## ⚠️ 免责声明
+### 5. 评测体系
 
-本项目仅用于学习和研究目的，提供的所有医疗健康信息仅供参考，**不能替代专业医生的诊断和治疗**。
+- **用例集**：200 条多轮用例、12 类场景（用药确认、拒绝收口、症状、医院、导诊、路线、知识、资讯、无需工具、多工具、急症、提示注入）；
+- **三层期望**：硬约束（工具、确认行为、禁止表述）→ 弱约束（关键词兜底）→ 软约束（LLM 评审分）；
+- **指标**：任务完成率（Wilson 95% CI）、工具 P/R/F1、风险混淆矩阵、首 token 与整轮 P50/P95、护栏命中率。
 
-如有身体不适，请及时就医。紧急情况请拨打 120 急救电话。
+详见 [`backend/evaluation/README.md`](backend/evaluation/README.md)。
 
-## 🛠️ 技术栈
+---
 
-### 后端
-- **FastAPI** — Web 框架
-- **LangGraph** — Agent 编排
-- **LangChain** — LLM 应用框架
-- **OpenAI API** — 大语言模型
-- **Pydantic** — 数据验证
+## API
 
-### 前端
-- **Vue 3** — 前端框架
-- **TypeScript** — 类型安全
-- **Ant Design Vue** — UI 组件库
-- **Axios** — HTTP 客户端
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/chat` | 非流式对话（无确认通道，高风险 fail-closed） |
+| POST | `/api/chat/stream` | 流式对话（SSE，可触发人工确认） |
+| POST | `/api/chat/approve` | 确认高风险操作并续跑 |
+| POST | `/api/chat/reject` | 拒绝对高风险操作，直接收口 |
+| GET | `/api/chat/runs/{run_id}` | 查询运行状态与待确认内容 |
+| GET | `/api/chat/conversations` | 会话列表 |
+| GET | `/api/chat/profile` | 用户健康画像 |
+| DELETE | `/api/chat/profile/memories/{memory_id}` | 删除单条记忆 |
+| GET | `/health` | 健康检查 |
 
-## 📝 开发说明
+SSE 事件类型：`thought / tool_call / tool_result / answer_delta / answer_reset / approval_required / answer / done`。
 
-### 魔改自
-本项目基于 [hello-agents-trip-planner](https://github.com/...) 魔改而来，主要改动：
+---
 
-1. **场景切换**：旅行规划 → 智能就医
-2. **架构升级**：线性流水线 → ReAct Agent (LangGraph)
-3. **交互升级**：表单提交 → 对话式交互
-4. **工具扩展**：4个工具 → 7个医疗工具
-5. **评估体系**：新增流水线 vs ReAct 对比评估
+## 已知局限
 
-### 核心改进点
+- **知识类问题检索不稳定**：18 条知识用例中有 9 条模型直接凭参数记忆作答，没调用知识库；下一步把"该不该调工具"从模型手里收回到路由层。
+- **工具数据边界**：医院搜索依赖高德 POI，没有医院等级/医保定点字段；路线工具失败时会降级，答案只能标注"未获取实时数据"。
+- **SQLite 单写者**：仅适合单实例部署，多实例需要换 Postgres/Redis。
+- **未做鉴权与限流**：公网部署前必须补，否则 API Key 有被刷的风险。
+- **checkpoint 无 TTL**：长期运行会持续增长，需要定期清理。
 
-- 从固定流程 → 自主决策
-- 从单次调用 → 多轮思考
-- 从被动执行 → 主动规划
-- 从刚性结构 → 灵活编排
+---
 
-## 📄 License
+## 免责声明
 
-MIT
+本项目仅用于学习、研究与技术演示，**不构成任何医疗建议**，也不能替代医生的诊断与治疗。如出现身体不适，请及时就医；紧急情况请立即拨打 120。
+
+## License
+
+MIT。项目骨架参考 hello-agents 系列开源示例（MIT）二次开发，特此致谢；主要改造包括 ReAct 状态图重构、三层护栏、SQLite 状态持久化与 200 条评测体系。

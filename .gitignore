@@ -17,3 +17,5 @@ backend/evaluation_results/
 # 系统
 .DS_Store
 Thumbs.db
+
+*.bak
