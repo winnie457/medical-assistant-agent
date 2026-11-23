@@ -241,7 +241,3 @@ SSE 事件类型：`thought / tool_call / tool_result / answer_delta / answer_re
 ## 免责声明
 
 本项目仅用于学习、研究与技术演示，**不构成任何医疗建议**，也不能替代医生的诊断与治疗。如出现身体不适，请及时就医；紧急情况请立即拨打 120。
-
-## License
-
-MIT。项目骨架参考 hello-agents 系列开源示例（MIT）二次开发，特此致谢；主要改造包括 ReAct 状态图重构、三层护栏、SQLite 状态持久化与 200 条评测体系。
