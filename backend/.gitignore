@@ -45,6 +45,12 @@ ENV/
 .coverage
 htmlcov/
 
+# 运行时数据（会话库 / 检查点 / 评测产物）
+data/
+evaluation/reports/
+app/data/user_profiles/eval.json
+app/data/user_profiles/recovery-bench.json
+
 # 操作系统
 .DS_Store
 Thumbs.db
